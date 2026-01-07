@@ -360,6 +360,12 @@ def main():
         default=0.9,
         help="vLLM GPU memory utilization (0.0-1.0)",
     )
+    parser.add_argument(
+        "--max_model_len",
+        type=int,
+        default=32768,
+        help="Max model length (tokens)",
+    )
 
     args = parser.parse_args()
 
@@ -376,11 +382,10 @@ def main():
         model=args.model_name,
         tensor_parallel_size=args.tp_size,
         download_dir=args.cache_dir,
-        max_model_len=16384,
+        max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,  # Adjust for Kaggle T4
         trust_remote_code=True,
         dtype="half",
-        attention_config={"use_torch_sdpa": True, "use_xformers": True},
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
