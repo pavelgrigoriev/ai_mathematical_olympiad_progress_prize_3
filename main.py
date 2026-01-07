@@ -118,9 +118,10 @@ class TransformersEngine:
         # Load params
         kwargs = {
             "device_map": "auto",
-            "torch_dtype": dtype,
+            "dtype": dtype,
             "cache_dir": cache_dir,
             "trust_remote_code": True,
+            "local_files_only": True
         }
         
         if load_in_4bit:
