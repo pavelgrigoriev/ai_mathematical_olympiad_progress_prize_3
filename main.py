@@ -375,7 +375,7 @@ def main():
         download_dir=args.cache_dir,
         gpu_memory_utilization=args.gpu_memory_utilization,  # Adjust for Kaggle T4
         trust_remote_code=True,
-        dtype="bfloat16",
+        dtype="half",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
