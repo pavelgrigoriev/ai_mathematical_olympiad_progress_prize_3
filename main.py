@@ -380,6 +380,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,  # Adjust for Kaggle T4
         trust_remote_code=True,
         dtype="half",
+        attention_config={"use_torch_sdpa": True, "use_xformers": True},
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
