@@ -3,5 +3,5 @@ torch
 transformers
 datasets
 accelerate
-llama-cpp-python
 pyarrow
+bitsandbytes

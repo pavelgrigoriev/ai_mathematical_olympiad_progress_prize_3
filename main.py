@@ -1,28 +1,17 @@
 import argparse
 import os
 import re
-from typing import Any, Dict, List, Union
-from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from transformers import AutoTokenizer
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     import pyarrow.parquet as pq
     PYARROW_AVAILABLE = True
 except ImportError:
     PYARROW_AVAILABLE = False
-
-# Define a dummy SamplingParams for compatibility or type hints if needed
-class SamplingParams:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-try:
-    from llama_cpp import Llama
-    LLAMA_CPP_AVAILABLE = True
-except ImportError:
-    LLAMA_CPP_AVAILABLE = False
 
 from datasets import load_dataset
 from prompts.executor import ExecutorPrompt
@@ -86,8 +75,6 @@ def apply_template(
     if system is not None:
         messages.insert(0, {"role": "system", "content": system})
 
-    # Note: enable_thinking is specific to some tokenizers/models variations
-    # We will try to pass it, but if it fails (not supported by method), we fallback.
     try:
         return tokenizer.apply_chat_template(
             messages,
@@ -106,88 +93,102 @@ def apply_template(
 
 def iter_parquet_file(path: str):
     """
-    Iterates over a parquet file batch by batch to save memory.
-    Yields individual rows as dicts.
+    Iterates over a parquet file batch by batch using pyarrow.
     """
     if not PYARROW_AVAILABLE:
         raise ImportError("pyarrow is required for reading large parquet files. pip install pyarrow")
     
     parquet_file = pq.ParquetFile(path)
-    # iter_batches yields RecordBatch
     for batch in parquet_file.iter_batches():
-        # Convert batch to pandas dataframe (this is efficient enough for reasonably sized batches)
         df = batch.to_pandas()
         for _, row in df.iterrows():
             yield row.to_dict()
 
 # ============================================================================
-# LLM WRAPPERS
+# INFERENCE ENGINE
 # ============================================================================
 
-class BaseLLM(ABC):
-    @abstractmethod
-    def generate(self, prompts: List[str], sampling_params: Any) -> List[str]:
-        pass
-
-class GGUFWrapper(BaseLLM):
-    def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1, **kwargs):
-        if not LLAMA_CPP_AVAILABLE:
-            raise ImportError("llama-cpp-python is not installed. Please install it to use this script.")
+class TransformersEngine:
+    def __init__(self, model_name: str, cache_dir: str = None, load_in_4bit: bool = False):
+        print(f"Loading model {model_name}...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        
+        # Load params
+        kwargs = {
+            "device_map": "auto",
+            "torch_dtype": dtype,
+            "cache_dir": cache_dir,
+            "trust_remote_code": True,
+        }
+        
+        if load_in_4bit:
+            kwargs["load_in_4bit"] = True
             
-        print(f"Loading GGUF model from: {model_path}")
-        self.llm = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            verbose=False,
-            **kwargs
-        )
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        
+        # Ensure pad token is set for batching
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Usually padding side left is better for generation
+            self.tokenizer.padding_side = 'left'
 
-    def generate(self, prompts: List[str], sampling_params: Any) -> List[str]:
-        results = []
+    def generate(self, prompts: List[str], sampling_params: Dict[str, Any] = None) -> List[str]:
+        if not prompts:
+            return []
+            
+        # Default params
+        if sampling_params is None:
+            sampling_params = {}
+            
+        temperature = sampling_params.get("temperature", 0.0) # 0.0 usually means greedy in implementations, but here we pass to HF
+        top_p = sampling_params.get("top_p", 1.0)
+        max_new_tokens = sampling_params.get("max_tokens", 1024)
+        do_sample = temperature > 0
         
-        # Extract params from SamplingParams or use dict
-        temperature = getattr(sampling_params, 'temperature', 0.7)
-        max_tokens = getattr(sampling_params, 'max_tokens', 1024)
-        stop = getattr(sampling_params, 'stop', [])
-        top_p = getattr(sampling_params, 'top_p', 0.95)
+        # Prepare Batch
+        # We need to handle potential OOMs with large batches, effectively strict batch_size maintenance is important
+        inputs = self.tokenizer(
+            prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, # Safety (though we hope prompts aren't too long)
+            # max_length=... if needed
+        ).to(self.device)
         
-        # llama-cpp generation
-        for i, prompt in enumerate(prompts):
-            # Print progress for serial generation
-            if len(prompts) > 1:
-                print(f"  Generating {i+1}/{len(prompts)}...", end='\r')
-                
-            output = self.llm(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                top_p=top_p,
-                echo=False
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature if do_sample else None,
+                top_p=top_p if do_sample else None,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
             )
-            results.append(output['choices'][0]['text'])
-        
-        if len(prompts) > 1:
-            print() # Newline after progress
             
-        return results
+        # Decode
+        # We only want the newly generated tokens. 
+        # HF generate returns prompt + new tokens.
+        input_len = inputs["input_ids"].shape[1]
+        generated_tokens = generated_ids[:, input_len:]
+        
+        decoded = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        return decoded
 
 # ============================================================================
 # PIPELINE STAGES
 # ============================================================================
 
-
 def process_batch(
-    llm: BaseLLM,
+    engine: TransformersEngine,
     batch: List[Dict[str, Any]],
-    tokenizer,
-    sampling_params: Any,
+    tokenizer, # Passed but we might use engine.tokenizer
+    sampling_params: Dict[str, Any],
     writers: Dict[str, ChunkedWriter],
 ):
-    """
-    Executes the multi-stage pipeline for a batch of data.
-    """
     if not batch:
         return
 
@@ -207,25 +208,19 @@ def process_batch(
         )
         prompts_planner.append(p)
 
-    # Generate plans
-    outputs_planner = llm.generate(prompts_planner, sampling_params)
+    outputs_planner = engine.generate(prompts_planner, sampling_params)
 
-    # Store results & prepare next stage inputs
     batch_with_plans = []
     planner_results = []
 
     for i, plan in enumerate(outputs_planner):
         item = batch[i]
-
-        planner_results.append(
-            {
-                "problem": item["problem"],
-                "assistant_response": plan,
-                "expected_answer": item["expected_answer"],
-                "problem_source": item["problem_source"],
-            }
-        )
-
+        planner_results.append({
+            "problem": item["problem"],
+            "assistant_response": plan,
+            "expected_answer": item["expected_answer"],
+            "problem_source": item["problem_source"],
+        })
         batch_with_plans.append(
             {**item, "plan_raw": plan, "plan_clean": remove_think_tags(plan)}
         )
@@ -249,24 +244,20 @@ def process_batch(
         )
         prompts_executor.append(p)
 
-    outputs_executor = llm.generate(prompts_executor, sampling_params)
+    outputs_executor = engine.generate(prompts_executor, sampling_params)
 
     batch_with_execs = []
     executor_results = []
 
     for i, execution in enumerate(outputs_executor):
         item = batch_with_plans[i]
-
-        executor_results.append(
-            {
-                "problem": item["problem"],
-                "plan": item["plan_clean"],
-                "assistant_response": execution,
-                "expected_answer": item["expected_answer"],
-                "problem_source": item["problem_source"],
-            }
-        )
-
+        executor_results.append({
+            "problem": item["problem"],
+            "plan": item["plan_clean"],
+            "assistant_response": execution,
+            "expected_answer": item["expected_answer"],
+            "problem_source": item["problem_source"],
+        })
         batch_with_execs.append(
             {
                 **item,
@@ -293,23 +284,20 @@ def process_batch(
         )
         prompts_ver_accept.append(p)
 
-    outputs_ver_accept = llm.generate(prompts_ver_accept, sampling_params)
+    outputs_ver_accept = engine.generate(prompts_ver_accept, sampling_params)
 
     verifier_results = []
     for i, ver_resp in enumerate(outputs_ver_accept):
         item = batch_with_execs[i]
-
-        verifier_results.append(
-            {
-                "problem": item["problem"],
-                "execution": item["execution_clean"],
-                "proposed_answer": item["expected_answer"],
-                "correct_answer": item["expected_answer"],
-                "assistant_response": ver_resp,
-                "label": "accept",
-                "problem_source": item["problem_source"],
-            }
-        )
+        verifier_results.append({
+            "problem": item["problem"],
+            "execution": item["execution_clean"],
+            "proposed_answer": item["expected_answer"],
+            "correct_answer": item["expected_answer"],
+            "assistant_response": ver_resp,
+            "label": "accept",
+            "problem_source": item["problem_source"],
+        })
 
     # -------------------------------------------------------------------------
     # STAGE 4: MUTATOR (ANSWER)
@@ -323,7 +311,7 @@ def process_batch(
         )
         prompts_mut_ans.append(p)
 
-    outputs_mut_ans = llm.generate(prompts_mut_ans, sampling_params)
+    outputs_mut_ans = engine.generate(prompts_mut_ans, sampling_params)
 
     batch_with_wrong_ans = []
     for i, wrong_raw in enumerate(outputs_mut_ans):
@@ -347,13 +335,11 @@ def process_batch(
         )
         prompts_mut_exec.append(p)
 
-    outputs_mut_exec = llm.generate(prompts_mut_exec, sampling_params)
+    outputs_mut_exec = engine.generate(prompts_mut_exec, sampling_params)
 
     batch_finished = []
     for i, mut_exec_raw in enumerate(outputs_mut_exec):
-        # Cleaning
         mut_exec_clean = remove_think_tags(mut_exec_raw).replace("```", "").strip()
-
         batch_finished.append(
             {**batch_with_wrong_ans[i], "mutated_execution": mut_exec_clean}
         )
@@ -375,24 +361,20 @@ def process_batch(
         )
         prompts_ver_reject.append(p)
 
-    outputs_ver_reject = llm.generate(prompts_ver_reject, sampling_params)
+    outputs_ver_reject = engine.generate(prompts_ver_reject, sampling_params)
 
     for i, ver_resp in enumerate(outputs_ver_reject):
         item = batch_finished[i]
+        verifier_results.append({
+            "problem": item["problem"],
+            "execution": item["mutated_execution"],
+            "proposed_answer": item["wrong_answer"],
+            "correct_answer": item["expected_answer"],
+            "assistant_response": ver_resp,
+            "label": "reject",
+            "problem_source": item["problem_source"],
+        })
 
-        verifier_results.append(
-            {
-                "problem": item["problem"],
-                "execution": item["mutated_execution"],
-                "proposed_answer": item["wrong_answer"],
-                "correct_answer": item["expected_answer"],
-                "assistant_response": ver_resp,
-                "label": "reject",
-                "problem_source": item["problem_source"],
-            }
-        )
-
-    # Add both accept and reject samples to writer
     writers["verifier"].add_batch(verifier_results)
 
 
@@ -402,121 +384,55 @@ def process_batch(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate datasets for Math Olympiad (GGUF Optimized)"
-    )
-    parser.add_argument(
-        "--cache_dir", type=str, default="./cache", help="HuggingFace cache directory"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./datasets",
-        help="Output directory for datasets",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=1,
-        help="Number of samples to process. -1 for all.",
-    )
-    parser.add_argument(
-        "--model_name", type=str, required=True, help="Path to GGUF model file"
-    )
-    parser.add_argument(
-        "--tokenizer_name", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct", help="HuggingFace tokenizer name"
-    )
-    parser.add_argument(
-        "--chunk_size", type=int, default=1000, help="Rows per parquet file"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=128, help="Batch size for pipeline processing (applies to data loading)"
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default="nvidia/OpenMathReasoning",
-        help="Dataset name or path to local file (supports .parquet via pyarrow only for fast loading)",
-    )
-    parser.add_argument(
-        "--max_model_len",
-        type=int,
-        default=4096,
-        help="Max context length (tokens)",
-    )
+    parser = argparse.ArgumentParser(description="Generate datasets (Transformers)")
+    parser.add_argument("--cache_dir", type=str, default="./cache")
+    parser.add_argument("--output_dir", type=str, default="./datasets")
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--chunk_size", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=4, help="Keep small for GPUs without vLLM")
+    parser.add_argument("--dataset_name", type=str, default="nvidia/OpenMathReasoning")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Use bitsandbytes 4bit quantization")
 
     args = parser.parse_args()
 
-    print(f"Config:")
-    print(f"  Model: {args.model_name}")
-    print(f"  Tokenizer: {args.tokenizer_name}")
-    print(f"  Samples: {args.num_samples if args.num_samples != -1 else 'ALL'}")
-    print(f"  Batch Size: {args.batch_size}")
-    print(f"  Output: {args.output_dir}")
+    print(f"Config: {args}")
 
-    # Initialize LLM
-    print(f"\nInitializing GGUF Model...")
-    llm = GGUFWrapper(
-        model_path=args.model_name,
-        n_ctx=args.max_model_len,
-        n_gpu_layers=-1 # Default to all on GPU
+    # Initialize Engine
+    engine = TransformersEngine(
+        model_name=args.model_name,
+        cache_dir=args.cache_dir,
+        load_in_4bit=args.load_in_4bit
     )
     
-    # Initialize Tokenizer
-    try:
-        print(f"Loading tokenizer from {args.tokenizer_name}...")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, cache_dir=args.cache_dir)
-    except Exception as e:
-        print(f"Failed to load tokenizer from {args.tokenizer_name}: {e}")
-        print("Please ensure you have internet access or a cached tokenizer.")
-        return
-
-    # Sampling params
-    sampling_params = type('Params', (), {
-        'temperature': 0.3,
-        'max_tokens': 4096,
-        'stop': ["<|im_end|>", "<|endoftext|>"],
-        'top_p': 0.95
-    })()
+    # Sampling Config
+    sampling_params = {
+        "temperature": 0.3,
+        "max_tokens": 4096,
+        "top_p": 0.95
+    }
 
     # Data Source
     print(f"Loading dataset: {args.dataset_name}")
-    
     ds = None
     if os.path.exists(args.dataset_name):
-        # Local file handling
         ext = args.dataset_name.split(".")[-1].lower()
         if ext == "parquet":
              print("Detected parquet file. Using pyarrow iterative loader.")
              ds = iter_parquet_file(args.dataset_name)
         else:
-            if ext == "jsonl":
-                ext = "json"
+            if ext == "jsonl": ext = "json"
             try:
                 ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=True)
-            except Exception as e:
-                 # Fallback
+            except:
                  ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=False)
     else:
-        # HuggingFace Datasets
-        ds = load_dataset(
-            args.dataset_name,
-            split="cot",
-            streaming=True,
-            cache_dir=args.cache_dir,
-        )
+        ds = load_dataset(args.dataset_name, split="cot", streaming=True, cache_dir=args.cache_dir)
 
-    # Writers
     writers = {
-        "planner": ChunkedWriter(
-            args.output_dir, "planner", chunk_size=args.chunk_size
-        ),
-        "executor": ChunkedWriter(
-            args.output_dir, "executor", chunk_size=args.chunk_size
-        ),
-        "verifier": ChunkedWriter(
-            args.output_dir, "verifier", chunk_size=args.chunk_size
-        ),
+        "planner": ChunkedWriter(args.output_dir, "planner", chunk_size=args.chunk_size),
+        "executor": ChunkedWriter(args.output_dir, "executor", chunk_size=args.chunk_size),
+        "verifier": ChunkedWriter(args.output_dir, "verifier", chunk_size=args.chunk_size),
     }
 
     current_batch = []
@@ -526,44 +442,40 @@ def main():
         for row in ds:
             if args.num_samples != -1 and total_processed >= args.num_samples:
                 break
-
+            
+            # Standardization
             current_dict = {
-                "problem": row["problem"],
-                "generated_solution": row["generated_solution"],
-                "expected_answer": row["expected_answer"],
+                "problem": row.get("problem", row.get("question", "")),
+                "generated_solution": row.get("generated_solution", row.get("solution", "")),
+                "expected_answer": row.get("expected_answer", row.get("answer", "")),
                 "problem_source": row.get("problem_source", ""),
             }
 
             current_batch.append(current_dict)
 
             if len(current_batch) >= args.batch_size:
-                print(
-                    f"\nProcessing batch {total_processed+1}..{total_processed+len(current_batch)}"
-                )
-                process_batch(llm, current_batch, tokenizer, sampling_params, writers)
+                print(f"Processing {total_processed + 1}..{total_processed + len(current_batch)}")
+                process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
                 total_processed += len(current_batch)
                 current_batch = []
 
-        # Process remaining
         if current_batch:
             if args.num_samples == -1 or total_processed < args.num_samples:
-                print(f"\nProcessing final batch of {len(current_batch)}")
-                process_batch(llm, current_batch, tokenizer, sampling_params, writers)
+                process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
                 total_processed += len(current_batch)
 
     except KeyboardInterrupt:
-        print("\nInterrupted! Saving data...")
+        print("\nInterrupted!")
 
     except Exception as e:
-        print(f"\nError processing data: {e}")
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()
 
     finally:
         for w in writers.values():
             w.close()
-        print(f"DONE! Processed {total_processed} samples.")
-
+        print(f"DONE! Processed {total_processed}")
 
 if __name__ == "__main__":
     main()
