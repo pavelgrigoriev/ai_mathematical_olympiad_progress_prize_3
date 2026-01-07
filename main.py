@@ -7,6 +7,12 @@ from abc import ABC, abstractmethod
 import pandas as pd
 from transformers import AutoTokenizer
 
+try:
+    import pyarrow.parquet as pq
+    PYARROW_AVAILABLE = True
+except ImportError:
+    PYARROW_AVAILABLE = False
+
 # Define a dummy SamplingParams for compatibility or type hints if needed
 class SamplingParams:
     def __init__(self, **kwargs):
@@ -93,6 +99,26 @@ def apply_template(
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+
+# ============================================================================
+# LOADING UTILS
+# ============================================================================
+
+def iter_parquet_file(path: str):
+    """
+    Iterates over a parquet file batch by batch to save memory.
+    Yields individual rows as dicts.
+    """
+    if not PYARROW_AVAILABLE:
+        raise ImportError("pyarrow is required for reading large parquet files. pip install pyarrow")
+    
+    parquet_file = pq.ParquetFile(path)
+    # iter_batches yields RecordBatch
+    for batch in parquet_file.iter_batches():
+        # Convert batch to pandas dataframe (this is efficient enough for reasonably sized batches)
+        df = batch.to_pandas()
+        for _, row in df.iterrows():
+            yield row.to_dict()
 
 # ============================================================================
 # LLM WRAPPERS
@@ -410,7 +436,7 @@ def main():
         "--dataset_name",
         type=str,
         default="nvidia/OpenMathReasoning",
-        help="Dataset name or path to local file",
+        help="Dataset name or path to local file (supports .parquet via pyarrow only for fast loading)",
     )
     parser.add_argument(
         "--max_model_len",
@@ -455,17 +481,24 @@ def main():
 
     # Data Source
     print(f"Loading dataset: {args.dataset_name}")
+    
+    ds = None
     if os.path.exists(args.dataset_name):
-        # Local file
-        ext = args.dataset_name.split(".")[-1]
-        if ext == "jsonl":
-            ext = "json"
-        try:
-            ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=True)
-        except Exception as e:
-             # Fallback if streaming not supported for local or specific format
-             ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=False)
+        # Local file handling
+        ext = args.dataset_name.split(".")[-1].lower()
+        if ext == "parquet":
+             print("Detected parquet file. Using pyarrow iterative loader.")
+             ds = iter_parquet_file(args.dataset_name)
+        else:
+            if ext == "jsonl":
+                ext = "json"
+            try:
+                ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=True)
+            except Exception as e:
+                 # Fallback
+                 ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=False)
     else:
+        # HuggingFace Datasets
         ds = load_dataset(
             args.dataset_name,
             split="cot",
@@ -520,6 +553,11 @@ def main():
 
     except KeyboardInterrupt:
         print("\nInterrupted! Saving data...")
+
+    except Exception as e:
+        print(f"\nError processing data: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         for w in writers.values():
