@@ -1,11 +1,22 @@
 import argparse
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
+from abc import ABC, abstractmethod
 
 import pandas as pd
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+
+# Define a dummy SamplingParams for compatibility or type hints if needed
+class SamplingParams:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    LLAMA_CPP_AVAILABLE = False
 
 from datasets import load_dataset
 from prompts.executor import ExecutorPrompt
@@ -16,7 +27,6 @@ from prompts.verifier import VerifierPrompt
 # ============================================================================
 # UTILS
 # ============================================================================
-
 
 class ChunkedWriter:
     def __init__(self, output_dir: str, prefix: str, chunk_size: int = 1000):
@@ -55,7 +65,7 @@ class ChunkedWriter:
 
 
 def remove_think_tags(text: str) -> str:
-    """Убирает <think>...</think> блок из текста"""
+    """Removes <think>...</think> block from text"""
     if text is None:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -72,7 +82,6 @@ def apply_template(
 
     # Note: enable_thinking is specific to some tokenizers/models variations
     # We will try to pass it, but if it fails (not supported by method), we fallback.
-    # vLLM usually takes the raw prompt string.
     try:
         return tokenizer.apply_chat_template(
             messages,
@@ -85,6 +94,58 @@ def apply_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
+# ============================================================================
+# LLM WRAPPERS
+# ============================================================================
+
+class BaseLLM(ABC):
+    @abstractmethod
+    def generate(self, prompts: List[str], sampling_params: Any) -> List[str]:
+        pass
+
+class GGUFWrapper(BaseLLM):
+    def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1, **kwargs):
+        if not LLAMA_CPP_AVAILABLE:
+            raise ImportError("llama-cpp-python is not installed. Please install it to use this script.")
+            
+        print(f"Loading GGUF model from: {model_path}")
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
+            **kwargs
+        )
+
+    def generate(self, prompts: List[str], sampling_params: Any) -> List[str]:
+        results = []
+        
+        # Extract params from SamplingParams or use dict
+        temperature = getattr(sampling_params, 'temperature', 0.7)
+        max_tokens = getattr(sampling_params, 'max_tokens', 1024)
+        stop = getattr(sampling_params, 'stop', [])
+        top_p = getattr(sampling_params, 'top_p', 0.95)
+        
+        # llama-cpp generation
+        for i, prompt in enumerate(prompts):
+            # Print progress for serial generation
+            if len(prompts) > 1:
+                print(f"  Generating {i+1}/{len(prompts)}...", end='\r')
+                
+            output = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                top_p=top_p,
+                echo=False
+            )
+            results.append(output['choices'][0]['text'])
+        
+        if len(prompts) > 1:
+            print() # Newline after progress
+            
+        return results
 
 # ============================================================================
 # PIPELINE STAGES
@@ -92,14 +153,14 @@ def apply_template(
 
 
 def process_batch(
-    llm: LLM,
+    llm: BaseLLM,
     batch: List[Dict[str, Any]],
     tokenizer,
-    sampling_params: SamplingParams,
+    sampling_params: Any,
     writers: Dict[str, ChunkedWriter],
 ):
     """
-    Executes the multi-stage pipeline for a batch of data using vLLM using ONE generate call per stage.
+    Executes the multi-stage pipeline for a batch of data.
     """
     if not batch:
         return
@@ -127,8 +188,7 @@ def process_batch(
     batch_with_plans = []
     planner_results = []
 
-    for i, output in enumerate(outputs_planner):
-        plan = output.outputs[0].text
+    for i, plan in enumerate(outputs_planner):
         item = batch[i]
 
         planner_results.append(
@@ -168,8 +228,7 @@ def process_batch(
     batch_with_execs = []
     executor_results = []
 
-    for i, output in enumerate(outputs_executor):
-        execution = output.outputs[0].text
+    for i, execution in enumerate(outputs_executor):
         item = batch_with_plans[i]
 
         executor_results.append(
@@ -211,8 +270,7 @@ def process_batch(
     outputs_ver_accept = llm.generate(prompts_ver_accept, sampling_params)
 
     verifier_results = []
-    for i, output in enumerate(outputs_ver_accept):
-        ver_resp = output.outputs[0].text
+    for i, ver_resp in enumerate(outputs_ver_accept):
         item = batch_with_execs[i]
 
         verifier_results.append(
@@ -242,8 +300,7 @@ def process_batch(
     outputs_mut_ans = llm.generate(prompts_mut_ans, sampling_params)
 
     batch_with_wrong_ans = []
-    for i, output in enumerate(outputs_mut_ans):
-        wrong_raw = output.outputs[0].text
+    for i, wrong_raw in enumerate(outputs_mut_ans):
         wrong_clean = remove_think_tags(wrong_raw).strip()
         batch_with_wrong_ans.append(
             {**batch_with_execs[i], "wrong_answer": wrong_clean}
@@ -264,14 +321,10 @@ def process_batch(
         )
         prompts_mut_exec.append(p)
 
-    # Note: Mutator Execution uses system prompt and no thinking usually,
-    # but here we use same sampling params for simplicity or user preference.
-    # Can adjust if needed.
     outputs_mut_exec = llm.generate(prompts_mut_exec, sampling_params)
 
     batch_finished = []
-    for i, output in enumerate(outputs_mut_exec):
-        mut_exec_raw = output.outputs[0].text
+    for i, mut_exec_raw in enumerate(outputs_mut_exec):
         # Cleaning
         mut_exec_clean = remove_think_tags(mut_exec_raw).replace("```", "").strip()
 
@@ -298,8 +351,7 @@ def process_batch(
 
     outputs_ver_reject = llm.generate(prompts_ver_reject, sampling_params)
 
-    for i, output in enumerate(outputs_ver_reject):
-        ver_resp = output.outputs[0].text
+    for i, ver_resp in enumerate(outputs_ver_reject):
         item = batch_finished[i]
 
         verifier_results.append(
@@ -325,7 +377,7 @@ def process_batch(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate datasets for Math Olympiad (vLLM Optimized)"
+        description="Generate datasets for Math Olympiad (GGUF Optimized)"
     )
     parser.add_argument(
         "--cache_dir", type=str, default="./cache", help="HuggingFace cache directory"
@@ -343,70 +395,83 @@ def main():
         help="Number of samples to process. -1 for all.",
     )
     parser.add_argument(
-        "--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Model identifier"
+        "--model_name", type=str, required=True, help="Path to GGUF model file"
+    )
+    parser.add_argument(
+        "--tokenizer_name", type=str, default="Qwen/Qwen2.5-Math-7B-Instruct", help="HuggingFace tokenizer name"
     )
     parser.add_argument(
         "--chunk_size", type=int, default=1000, help="Rows per parquet file"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=128, help="Batch size for pipeline processing"
-    )
-    parser.add_argument(
-        "--tp_size", type=int, default=1, help="Tensor Parallelism size (GPU count)"
-    )
-    parser.add_argument(
-        "--gpu_memory_utilization",
-        type=float,
-        default=0.9,
-        help="vLLM GPU memory utilization (0.0-1.0)",
+        "--batch_size", type=int, default=128, help="Batch size for pipeline processing (applies to data loading)"
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
         default="nvidia/OpenMathReasoning",
-        help="Dataset name",
+        help="Dataset name or path to local file",
     )
     parser.add_argument(
         "--max_model_len",
         type=int,
-        default=32768,
-        help="Max model length (tokens)",
+        default=4096,
+        help="Max context length (tokens)",
     )
 
     args = parser.parse_args()
 
     print(f"Config:")
     print(f"  Model: {args.model_name}")
+    print(f"  Tokenizer: {args.tokenizer_name}")
     print(f"  Samples: {args.num_samples if args.num_samples != -1 else 'ALL'}")
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Output: {args.output_dir}")
-    print(f"  GPU Util: {args.gpu_memory_utilization}")
 
-    # Initialize vLLM
-    print("\nInitializing vLLM...")
-    llm = LLM(
-        model=args.model_name,
-        tensor_parallel_size=args.tp_size,
-        download_dir=args.cache_dir,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,  # Adjust for Kaggle T4
-        trust_remote_code=True,
-        dtype="half",
+    # Initialize LLM
+    print(f"\nInitializing GGUF Model...")
+    llm = GGUFWrapper(
+        model_path=args.model_name,
+        n_ctx=args.max_model_len,
+        n_gpu_layers=-1 # Default to all on GPU
     )
+    
+    # Initialize Tokenizer
+    try:
+        print(f"Loading tokenizer from {args.tokenizer_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, cache_dir=args.cache_dir)
+    except Exception as e:
+        print(f"Failed to load tokenizer from {args.tokenizer_name}: {e}")
+        print("Please ensure you have internet access or a cached tokenizer.")
+        return
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=args.cache_dir)
-
-    sampling_params = SamplingParams(
-        temperature=0.3, max_tokens=4096, stop=["<|im_end|>", "<|endoftext|>"]
-    )
+    # Sampling params
+    sampling_params = type('Params', (), {
+        'temperature': 0.3,
+        'max_tokens': 4096,
+        'stop': ["<|im_end|>", "<|endoftext|>"],
+        'top_p': 0.95
+    })()
 
     # Data Source
-    ds = load_dataset(
-        args.dataset_name,
-        split="cot",
-        streaming=True,
-        cache_dir=args.cache_dir,
-    )
+    print(f"Loading dataset: {args.dataset_name}")
+    if os.path.exists(args.dataset_name):
+        # Local file
+        ext = args.dataset_name.split(".")[-1]
+        if ext == "jsonl":
+            ext = "json"
+        try:
+            ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=True)
+        except Exception as e:
+             # Fallback if streaming not supported for local or specific format
+             ds = load_dataset(ext, data_files=args.dataset_name, split="train", streaming=False)
+    else:
+        ds = load_dataset(
+            args.dataset_name,
+            split="cot",
+            streaming=True,
+            cache_dir=args.cache_dir,
+        )
 
     # Writers
     writers = {
