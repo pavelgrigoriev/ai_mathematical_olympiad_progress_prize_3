@@ -110,7 +110,16 @@ def iter_parquet_file(path: str):
 
 class TransformersEngine:
     def __init__(self, model_name: str, cache_dir: str = None, load_in_4bit: bool = False):
-        print(f"Loading model {model_name}...")
+        print(f"Loading model from: {model_name}")
+        
+        # Check if local path exists
+        if os.path.exists(model_name):
+            print(f"  [+] Found local directory: {model_name}")
+            if not os.path.isdir(model_name):
+                print(f"  [!] Warning: {model_name} exists but is not a directory.")
+        else:
+            print(f"  [!] Warning: Path {model_name} not found locally. Transformers might try to download it as a repo ID.")
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         dtype = torch.float16 if self.device == "cuda" else torch.float32
@@ -118,17 +127,33 @@ class TransformersEngine:
         # Load params
         kwargs = {
             "device_map": "auto",
-            "dtype": dtype,
+            "torch_dtype": dtype, 
             "cache_dir": cache_dir,
             "trust_remote_code": True,
-            "local_files_only": True
         }
+        
+        # Only add local_files_only if it exists, to prevent validation errors on bad paths
+        if os.path.exists(model_name):
+            kwargs["local_files_only"] = True
         
         if load_in_4bit:
             kwargs["load_in_4bit"] = True
             
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Trying again without local_files_only...")
+            if "local_files_only" in kwargs:
+                del kwargs["local_files_only"]
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        except:
+             # Fallback if tokenizer not in same dir (unlikely for local)
+             print("Tokenizer load failed, assuming standard.")
+             self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         
         # Ensure pad token is set for batching
         if self.tokenizer.pad_token is None:
@@ -144,19 +169,17 @@ class TransformersEngine:
         if sampling_params is None:
             sampling_params = {}
             
-        temperature = sampling_params.get("temperature", 0.0) # 0.0 usually means greedy in implementations, but here we pass to HF
+        temperature = sampling_params.get("temperature", 0.0) 
         top_p = sampling_params.get("top_p", 1.0)
         max_new_tokens = sampling_params.get("max_tokens", 1024)
         do_sample = temperature > 0
         
         # Prepare Batch
-        # We need to handle potential OOMs with large batches, effectively strict batch_size maintenance is important
         inputs = self.tokenizer(
             prompts, 
             return_tensors="pt", 
             padding=True, 
-            truncation=True, # Safety (though we hope prompts aren't too long)
-            # max_length=... if needed
+            truncation=True, 
         ).to(self.device)
         
         with torch.no_grad():
@@ -171,8 +194,6 @@ class TransformersEngine:
             )
             
         # Decode
-        # We only want the newly generated tokens. 
-        # HF generate returns prompt + new tokens.
         input_len = inputs["input_ids"].shape[1]
         generated_tokens = generated_ids[:, input_len:]
         
