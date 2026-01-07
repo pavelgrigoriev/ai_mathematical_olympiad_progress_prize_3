@@ -361,6 +361,12 @@ def main():
         help="vLLM GPU memory utilization (0.0-1.0)",
     )
     parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="nvidia/OpenMathReasoning",
+        help="Dataset name",
+    )
+    parser.add_argument(
         "--max_model_len",
         type=int,
         default=32768,
@@ -396,7 +402,7 @@ def main():
 
     # Data Source
     ds = load_dataset(
-        "nvidia/OpenMathReasoning",
+        args.dataset_name,
         split="cot",
         streaming=True,
         cache_dir=args.cache_dir,
