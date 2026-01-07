@@ -355,7 +355,10 @@ def main():
         "--tp_size", type=int, default=1, help="Tensor Parallelism size (GPU count)"
     )
     parser.add_argument(
-        "--gpu_memory_utilization", type=float, default=0.9, help="vLLM GPU memory utilization (0.0-1.0)"
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="vLLM GPU memory utilization (0.0-1.0)",
     )
 
     args = parser.parse_args()
@@ -373,6 +376,7 @@ def main():
         model=args.model_name,
         tensor_parallel_size=args.tp_size,
         download_dir=args.cache_dir,
+        max_model_len=16384,
         gpu_memory_utilization=args.gpu_memory_utilization,  # Adjust for Kaggle T4
         trust_remote_code=True,
         dtype="half",
