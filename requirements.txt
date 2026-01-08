@@ -1,7 +1,8 @@
 pandas
 torch
 transformers
-datasets
+dauto-gptq
+tqdms
 accelerate
 pyarrow
 bitsandbytes

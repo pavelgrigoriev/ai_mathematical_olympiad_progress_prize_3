@@ -1,9 +1,11 @@
 import argparse
 import os
 import re
+import logging
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from tqdm import tqdm
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,6 +20,14 @@ from prompts.executor import ExecutorPrompt
 from prompts.mutator import MutatorPrompt
 from prompts.planner import PlannerPrompt
 from prompts.verifier import VerifierPrompt
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # UTILS
@@ -49,7 +59,7 @@ class ChunkedWriter:
         path = os.path.join(self.output_dir, filename)
 
         df.to_parquet(path, index=False)
-        print(f"Saved {path} ({len(df)} rows)")
+        logger.info(f"Saved {path} ({len(df)} rows)")
 
         self.chunk_counter += 1
 
@@ -110,15 +120,15 @@ def iter_parquet_file(path: str):
 
 class TransformersEngine:
     def __init__(self, model_name: str, cache_dir: str = None, load_in_4bit: bool = False):
-        print(f"Loading model from: {model_name}")
+        logger.info(f"Loading model from: {model_name}")
         
         # Check if local path exists
         if os.path.exists(model_name):
-            print(f"  [+] Found local directory: {model_name}")
+            logger.info(f"Found local directory: {model_name}")
             if not os.path.isdir(model_name):
-                print(f"  [!] Warning: {model_name} exists but is not a directory.")
+                logger.warning(f"Warning: {model_name} exists but is not a directory.")
         else:
-            print(f"  [!] Warning: Path {model_name} not found locally. Transformers might try to download it as a repo ID.")
+            logger.warning(f"Warning: Path {model_name} not found locally. Transformers might try to download it as a repo ID.")
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -127,7 +137,7 @@ class TransformersEngine:
         # Load params
         kwargs = {
             "device_map": "auto",
-            "dtype": dtype, 
+            "torch_dtype": dtype, 
             "cache_dir": cache_dir,
             "trust_remote_code": True,
         }
@@ -142,8 +152,8 @@ class TransformersEngine:
         try:
             self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
         except Exception as e:
-            print(f"Error loading model: {e}")
-            print("Trying again without local_files_only...")
+            logger.error(f"Error loading model: {e}")
+            logger.info("Trying again without local_files_only...")
             if "local_files_only" in kwargs:
                 del kwargs["local_files_only"]
             self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
@@ -152,10 +162,9 @@ class TransformersEngine:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         except:
              # Fallback if tokenizer not in same dir (unlikely for local)
-             print("Tokenizer load failed, assuming standard.")
+             logger.warning("Tokenizer load failed, assuming standard.")
              self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         
-        # Ensure pad token is set for batching
         # Ensure pad token is set for batching
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -184,27 +193,6 @@ class TransformersEngine:
             truncation=True, 
         ).to(self.device)
         
-        stop_strings = sampling_params.get("stop", [])
-        if isinstance(stop_strings, str):
-            stop_strings = [stop_strings]
-            
-        # Resolve EOS token IDs
-        eos_token_ids = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
-        
-        # Add custom stop tokens if they exist in tokenizer
-        for s in stop_strings:
-            # Note: This is a simple heuristic. For complex tokenizers, encoding string might yield multiple tokens.
-            # We assume stop words are single tokens or we take the last one, or we need a StoppingCriteria.
-            # For simplicity in this script, we try to find the direct ID.
-            ids = self.tokenizer.encode(s, add_special_tokens=False)
-            if ids:
-                eos_token_ids.extend(ids)
-        
-        # Remove duplicates
-        eos_token_ids = list(set(eos_token_ids))
-
-        print(f"    Generating with max_new_tokens={max_new_tokens}...")
-
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
@@ -213,7 +201,7 @@ class TransformersEngine:
                 top_p=top_p if do_sample else None,
                 do_sample=do_sample,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=eos_token_ids,
+                eos_token_id=self.tokenizer.eos_token_id,
             )
             
         # Decode
@@ -441,7 +429,7 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Config: {args}")
+    logger.info(f"Config: {args}")
 
     # Initialize Engine
     engine = TransformersEngine(
@@ -458,12 +446,12 @@ def main():
     }
 
     # Data Source
-    print(f"Loading dataset: {args.dataset_name}")
+    logger.info(f"Loading dataset: {args.dataset_name}")
     ds = None
     if os.path.exists(args.dataset_name):
         ext = args.dataset_name.split(".")[-1].lower()
         if ext == "parquet":
-             print("Detected parquet file. Using pyarrow iterative loader.")
+             logger.info("Detected parquet file. Using pyarrow iterative loader.")
              ds = iter_parquet_file(args.dataset_name)
         else:
             if ext == "jsonl": ext = "json"
@@ -484,43 +472,53 @@ def main():
     total_processed = 0
 
     try:
-        for row in ds:
-            if args.num_samples != -1 and total_processed >= args.num_samples:
-                break
-            
-            # Standardization
-            current_dict = {
-                "problem": row.get("problem", row.get("question", "")),
-                "generated_solution": row.get("generated_solution", row.get("solution", "")),
-                "expected_answer": row.get("expected_answer", row.get("answer", "")),
-                "problem_source": row.get("problem_source", ""),
-            }
+        # Wrap dataset iterator with tqdm if possible, but for streaming/generators, simply iterating is fine.
+        # If we have num_samples, we can add a total.
+        pbar_total = args.num_samples if args.num_samples != -1 else None
+        
+        # We wrap the loop. Note that since we batch inside, tqdm will tick per sample.
+        # However, we yield one by one from ds.
+        
+        with tqdm(total=pbar_total, desc="Processing Samples", unit="sample") as pbar:
+            for row in ds:
+                if args.num_samples != -1 and total_processed >= args.num_samples:
+                    break
+                
+                # Standardization
+                current_dict = {
+                    "problem": row.get("problem", row.get("question", "")),
+                    "generated_solution": row.get("generated_solution", row.get("solution", "")),
+                    "expected_answer": row.get("expected_answer", row.get("answer", "")),
+                    "problem_source": row.get("problem_source", ""),
+                }
 
-            current_batch.append(current_dict)
+                current_batch.append(current_dict)
+                pbar.update(1)
 
-            if len(current_batch) >= args.batch_size:
-                print(f"Processing {total_processed + 1}..{total_processed + len(current_batch)}")
-                process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
-                total_processed += len(current_batch)
-                current_batch = []
+                if len(current_batch) >= args.batch_size:
+                    # logger.info(f"Processing batch of size {len(current_batch)}...") # Too verbose if inside using tqdm
+                    process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
+                    total_processed += len(current_batch)
+                    current_batch = []
 
-        if current_batch:
-            if args.num_samples == -1 or total_processed < args.num_samples:
-                process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
-                total_processed += len(current_batch)
+            # Final batch
+            if current_batch:
+                if args.num_samples == -1 or total_processed < args.num_samples:
+                    process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
+                    total_processed += len(current_batch)
 
     except KeyboardInterrupt:
-        print("\nInterrupted!")
+        logger.info("Interrupted!")
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         import traceback
         traceback.print_exc()
 
     finally:
         for w in writers.values():
             w.close()
-        print(f"DONE! Processed {total_processed}")
+        logger.info(f"DONE! Processed {total_processed}")
 
 if __name__ == "__main__":
     main()
