@@ -156,10 +156,12 @@ class TransformersEngine:
              self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
         
         # Ensure pad token is set for batching
+        # Ensure pad token is set for batching
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            # Usually padding side left is better for generation
-            self.tokenizer.padding_side = 'left'
+        
+        # Always set left padding for decoder-only models (fixes warning)
+        self.tokenizer.padding_side = 'left'
 
     def generate(self, prompts: List[str], sampling_params: Dict[str, Any] = None) -> List[str]:
         if not prompts:
