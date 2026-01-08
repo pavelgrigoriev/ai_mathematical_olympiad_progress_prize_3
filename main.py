@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
 
 try:
     import pyarrow.parquet as pq
@@ -130,59 +131,59 @@ def iter_parquet_file(path: str, batch_size: int = 10_000, columns: List[str] = 
 # INFERENCE ENGINE
 # ============================================================================
 
-class TransformersEngine:
-    def __init__(self, model_name: str, cache_dir: str = None, load_in_4bit: bool = False):
-        logger.info(f"Loading model from: {model_name}")
+class vLLMEngine:
+    def __init__(self, model_name: str, cache_dir: str = None, max_model_len: int = None, 
+                 tensor_parallel_size: int = 1, gpu_memory_utilization: float = 0.9):
+        logger.info(f"Loading model with vLLM from: {model_name}")
         
-        # Check if local path exists
-        if os.path.exists(model_name):
-            logger.info(f"Found local directory: {model_name}")
-            if not os.path.isdir(model_name):
-                logger.warning(f"Warning: {model_name} exists but is not a directory.")
-        else:
-            logger.warning(f"Warning: Path {model_name} not found locally. Transformers might try to download it as a repo ID.")
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Load tokenizer for prompt length validation
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer: {e}. Using default.")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, trust_remote_code=True)
         
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        
-        # Load params
-        kwargs = {
-            "device_map": "auto",
-            "torch_dtype": dtype, 
-            "cache_dir": cache_dir,
+        # vLLM initialization
+        vllm_kwargs = {
+            "model": model_name,
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
             "trust_remote_code": True,
         }
         
-        # Only add local_files_only if it exists, to prevent validation errors on bad paths
-        if os.path.exists(model_name):
-            kwargs["local_files_only"] = True
-        
-        if load_in_4bit:
-            kwargs["load_in_4bit"] = True
+        if cache_dir:
+            vllm_kwargs["download_dir"] = cache_dir
             
+        if max_model_len:
+            vllm_kwargs["max_model_len"] = max_model_len
+        
         try:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            self.llm = LLM(**vllm_kwargs)
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            logger.info("Trying again without local_files_only...")
-            if "local_files_only" in kwargs:
-                del kwargs["local_files_only"]
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+            logger.error(f"Error loading vLLM model: {e}")
+            raise
+        
+        # Get the actual max model length from vLLM
+        self.max_model_len = self.llm.llm_engine.model_config.max_model_len
+        logger.info(f"Model max context length: {self.max_model_len}")
 
+    def _validate_prompt_length(self, prompt: str, max_tokens: int = 1024) -> bool:
+        """Check if prompt + max_tokens fits within model's context window"""
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-        except:
-             # Fallback if tokenizer not in same dir (unlikely for local)
-             logger.warning("Tokenizer load failed, assuming standard.")
-             self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-        
-        # Ensure pad token is set for batching
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Always set left padding for decoder-only models (fixes warning)
-        self.tokenizer.padding_side = 'left'
+            tokens = self.tokenizer.encode(prompt)
+            prompt_len = len(tokens)
+            total_len = prompt_len + max_tokens
+            
+            if total_len > self.max_model_len:
+                logger.warning(
+                    f"Skipping prompt: length {prompt_len} + max_tokens {max_tokens} = {total_len} "
+                    f"exceeds max_model_len {self.max_model_len}"
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error validating prompt length: {e}")
+            return True  # Allow through if validation fails
 
     def generate(self, prompts: List[str], sampling_params: Dict[str, Any] = None) -> List[str]:
         if not prompts:
@@ -194,43 +195,56 @@ class TransformersEngine:
             
         temperature = sampling_params.get("temperature", 0.0) 
         top_p = sampling_params.get("top_p", 1.0)
-        max_new_tokens = sampling_params.get("max_tokens", 1024)
-        do_sample = temperature > 0
+        max_tokens = sampling_params.get("max_tokens", 1024)
         
-        # Prepare Batch
-        inputs = self.tokenizer(
-            prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-        ).to(self.device)
+        # Filter out prompts that are too long
+        valid_indices = []
+        valid_prompts = []
         
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature if do_sample else None,
-                top_p=top_p if do_sample else None,
-                do_sample=do_sample,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-            
-        # Decode
-        input_len = inputs["input_ids"].shape[1]
-        generated_tokens = generated_ids[:, input_len:]
+        for i, prompt in enumerate(prompts):
+            if self._validate_prompt_length(prompt, max_tokens):
+                valid_indices.append(i)
+                valid_prompts.append(prompt)
         
-        decoded = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        return decoded
+        if len(valid_prompts) < len(prompts):
+            logger.warning(f"Filtered {len(prompts) - len(valid_prompts)} prompts due to length")
+        
+        # Create vLLM sampling params
+        vllm_sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+        
+        # Generate
+        if not valid_prompts:
+            logger.warning("No valid prompts to generate!")
+            return [""] * len(prompts)
+        
+        outputs = self.llm.generate(valid_prompts, vllm_sampling_params)
+        
+        # Extract generated text
+        generated_texts = [output.outputs[0].text for output in outputs]
+        
+        # Reconstruct full results array with empty strings for filtered prompts
+        results = []
+        valid_idx = 0
+        for i in range(len(prompts)):
+            if i in valid_indices:
+                results.append(generated_texts[valid_idx])
+                valid_idx += 1
+            else:
+                results.append("")  # Empty string for filtered prompts
+        
+        return results
 
 # ============================================================================
 # PIPELINE STAGES
 # ============================================================================
 
 def process_batch(
-    engine: TransformersEngine,
+    engine: vLLMEngine,
     batch: List[Dict[str, Any]],
-    tokenizer, # Passed but we might use engine.tokenizer
     sampling_params: Dict[str, Any],
     writers: Dict[str, ChunkedWriter],
 ):
@@ -243,7 +257,7 @@ def process_batch(
     prompts_planner = []
     for item in batch:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             PlannerPrompt.user.format(
                 problem=item["problem"],
                 solution=item["generated_solution"],
@@ -278,7 +292,7 @@ def process_batch(
     prompts_executor = []
     for item in batch_with_plans:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             ExecutorPrompt.user.format(
                 problem=item["problem"],
                 plan=item["plan_clean"],
@@ -319,7 +333,7 @@ def process_batch(
     prompts_ver_accept = []
     for item in batch_with_execs:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             VerifierPrompt.user_accept.format(
                 problem=item["problem"],
                 execution=item["execution_clean"],
@@ -350,7 +364,7 @@ def process_batch(
     prompts_mut_ans = []
     for item in batch_with_execs:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             MutatorPrompt.wrong_answer_user.format(ans=item["expected_answer"]),
             system=None,
         )
@@ -371,7 +385,7 @@ def process_batch(
     prompts_mut_exec = []
     for item in batch_with_wrong_ans:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             MutatorPrompt.bad_execution_user.format(
                 execution=item["execution_clean"], wrong_answer=item["wrong_answer"]
             ),
@@ -395,7 +409,7 @@ def process_batch(
     prompts_ver_reject = []
     for item in batch_finished:
         p = apply_template(
-            tokenizer,
+            engine.tokenizer,
             VerifierPrompt.user_reject.format(
                 problem=item["problem"],
                 execution=item["mutated_execution"],
@@ -429,25 +443,29 @@ def process_batch(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate datasets (Transformers)")
+    parser = argparse.ArgumentParser(description="Generate datasets (vLLM)")
     parser.add_argument("--cache_dir", type=str, default="./cache")
     parser.add_argument("--output_dir", type=str, default="./datasets")
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--chunk_size", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=4, help="Keep small for GPUs without vLLM")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of samples to process together")
     parser.add_argument("--dataset_name", type=str, default="nvidia/OpenMathReasoning")
-    parser.add_argument("--load_in_4bit", action="store_true", help="Use bitsandbytes 4bit quantization")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of GPUs for tensor parallelism")
+    parser.add_argument("--max_model_len", type=int, default=None, help="Override model's max context length")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization (0.0-1.0)")
 
     args = parser.parse_args()
 
     logger.info(f"Config: {args}")
 
-    # Initialize Engine
-    engine = TransformersEngine(
+    # Initialize vLLM Engine
+    engine = vLLMEngine(
         model_name=args.model_name,
         cache_dir=args.cache_dir,
-        load_in_4bit=args.load_in_4bit
+        max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
     
     # Sampling Config
@@ -509,14 +527,14 @@ def main():
 
                 if len(current_batch) >= args.batch_size:
                     # logger.info(f"Processing batch of size {len(current_batch)}...") # Too verbose if inside using tqdm
-                    process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
+                    process_batch(engine, current_batch, sampling_params, writers)
                     total_processed += len(current_batch)
                     current_batch = []
 
             # Final batch
             if current_batch:
                 if args.num_samples == -1 or total_processed < args.num_samples:
-                    process_batch(engine, current_batch, engine.tokenizer, sampling_params, writers)
+                    process_batch(engine, current_batch, sampling_params, writers)
                     total_processed += len(current_batch)
 
     except KeyboardInterrupt:

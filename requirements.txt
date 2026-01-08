@@ -2,7 +2,9 @@ pandas
 torch
 transformers
 dauto-gptq
-tqdms
+tqdm
 accelerate
 pyarrow
 bitsandbytes
+vllm
+datasets
