@@ -127,7 +127,7 @@ class TransformersEngine:
         # Load params
         kwargs = {
             "device_map": "auto",
-            "torch_dtype": dtype, 
+            "dtype": dtype, 
             "cache_dir": cache_dir,
             "trust_remote_code": True,
         }
