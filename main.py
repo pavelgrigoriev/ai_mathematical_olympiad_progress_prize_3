@@ -101,18 +101,30 @@ def apply_template(
 # LOADING UTILS
 # ============================================================================
 
-def iter_parquet_file(path: str):
+def iter_parquet_file(path: str, batch_size: int = 10_000, columns: List[str] = None):
     """
-    Iterates over a parquet file batch by batch using pyarrow.
+    Memory-efficient iteration over a parquet file.
+    
+    Args:
+        path: Path to parquet file
+        batch_size: Number of rows per batch (controls memory usage)
+        columns: Optional list of columns to read (reduces memory if you don't need all)
     """
     if not PYARROW_AVAILABLE:
-        raise ImportError("pyarrow is required for reading large parquet files. pip install pyarrow")
+        raise ImportError("pyarrow is required. pip install pyarrow")
     
     parquet_file = pq.ParquetFile(path)
-    for batch in parquet_file.iter_batches():
-        df = batch.to_pandas()
-        for _, row in df.iterrows():
-            yield row.to_dict()
+    
+    # Можно указать columns для чтения только нужных столбцов
+    iter_kwargs = {"batch_size": batch_size}
+    if columns:
+        iter_kwargs["columns"] = columns
+    
+    for batch in parquet_file.iter_batches(**iter_kwargs):
+        # Вариант 1: Напрямую из PyArrow (самый быстрый)
+        for row in batch.to_pylist():
+            yield row
+        
 
 # ============================================================================
 # INFERENCE ENGINE
