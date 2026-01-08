@@ -184,6 +184,27 @@ class TransformersEngine:
             truncation=True, 
         ).to(self.device)
         
+        stop_strings = sampling_params.get("stop", [])
+        if isinstance(stop_strings, str):
+            stop_strings = [stop_strings]
+            
+        # Resolve EOS token IDs
+        eos_token_ids = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
+        
+        # Add custom stop tokens if they exist in tokenizer
+        for s in stop_strings:
+            # Note: This is a simple heuristic. For complex tokenizers, encoding string might yield multiple tokens.
+            # We assume stop words are single tokens or we take the last one, or we need a StoppingCriteria.
+            # For simplicity in this script, we try to find the direct ID.
+            ids = self.tokenizer.encode(s, add_special_tokens=False)
+            if ids:
+                eos_token_ids.extend(ids)
+        
+        # Remove duplicates
+        eos_token_ids = list(set(eos_token_ids))
+
+        print(f"    Generating with max_new_tokens={max_new_tokens}...")
+
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
@@ -192,7 +213,7 @@ class TransformersEngine:
                 top_p=top_p if do_sample else None,
                 do_sample=do_sample,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=eos_token_ids,
             )
             
         # Decode
