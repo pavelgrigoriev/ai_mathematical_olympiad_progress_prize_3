@@ -1,0 +1,10 @@
+pandas
+torch
+transformers
+dauto-gptq
+tqdm
+accelerate
+pyarrow
+bitsandbytes
+vllm
+datasets
